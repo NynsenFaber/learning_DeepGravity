@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 import tqdm
 
-from scipy.spatial.distance import pdist
+from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import csr_matrix
 from itertools import combinations
 
@@ -41,12 +41,12 @@ class DataConfig:
 	# Input File Paths
 	COMMUTE_PATH = "../data/processed_data/commute_data.pickle"
 	SECTIONS_PATH = "../data/processed_data/sections_features.parquet"
-	TESSELATION_PATH = "../data/processed_data/tessellation_25km.parquet"
+	TESSELLATION_PATH = "../data/processed_data/tessellation_25km.parquet"
 
 	# Adjust these relative paths as needed for your project structure
 	COMMUTE_PATH: Path = (BASE_DIR / COMMUTE_PATH).resolve()
 	SECTIONS_PATH: Path = (BASE_DIR / SECTIONS_PATH).resolve()
-	TESSELATION_PATH: Path = (BASE_DIR / TESSELATION_PATH).resolve()
+	TESSELLATION_PATH: Path = (BASE_DIR / TESSELLATION_PATH).resolve()
 
 	# Processing Constants
 	EXCLUDE_COLS: Tuple[str, ...] = ('geometry', 'SEZ2011')
@@ -57,6 +57,9 @@ class DataConfig:
 
 	# Logging Control
 	VERBOSE: bool = True
+
+	# Scaler for normalization
+	SCALER: Optional[MinMaxScaler] = None
 
 
 class MobilityDataManager(Dataset):
@@ -79,10 +82,17 @@ class MobilityDataManager(Dataset):
 		self.sections: Dict[int, shapely.geometry.Polygon] = {}  # origin_idx -> geometry
 		self.y: Dict[int, torch.Tensor] = {}  # (origin_idx, dest_idx) -> prob
 		self.scaler: Optional[MinMaxScaler] = None  # to rescale features
-		self.distance: Optional[np.ndarray] = None  # Container for distances
-		self._mph: Optional[bbhash.PyMPHF] = None  # Perfectly Minimal Hash for (origin_idx, dest_idx) -> distance
+		self.probability: Dict[Tuple[int, int], float] = {}  # (origin_idx, dest_idx) -> prob
 		self._d_max: Optional[int] = None  # to rescale distance
 		self._d_min: Optional[int] = None  # to rescale distance
+
+		# (POSSIBLE UPDATE) for better GPU performance during training and testing
+		# at the price of larger space. Store a distance tensor for each tile
+		# self.tile_distance_matrices: List[torch.Tensor] = [] # tile_idx -> distance matrix of the tile
+
+		# (COMMENT OUT) If using _process_distance_bbhash
+		self._mph: Optional[bbhash.PyMPHF] = None  # Perfectly Minimal Hash for (origin_idx, dest_idx) -> distance
+		self.distance: Optional[np.ndarray] = None  # Container for distances
 
 		## ---- Temporary Raw Data ----
 		self.commute_data: Dict[str, Dict[str, float]] = {}
@@ -121,14 +131,11 @@ class MobilityDataManager(Dataset):
 	# self._build_fast_index_map()  # Final optimization step
 
 	def _setup_logger(self):
-		"""Configures a local logger instance."""
+		# Use the class name so logs are traceable
 		self.logger = logging.getLogger(self.__class__.__name__)
-		if not self.logger.handlers:
-			handler = logging.StreamHandler()
-			formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-			handler.setFormatter(formatter)
-			self.logger.addHandler(handler)
 
+		# It's okay to set the Level here if you want to silence this specific class
+		# by default, but generally, even this is often done in the main script.
 		self.logger.setLevel(logging.INFO if self.config.VERBOSE else logging.WARNING)
 
 	def _load_raw_data(self):
@@ -150,10 +157,10 @@ class MobilityDataManager(Dataset):
 		self.sections_gdf.to_crs(epsg = self.config.CRS_METRIC, inplace = True)
 
 		# 3. Tessellation
-		if not self.config.TESSELATION_PATH.exists():
-			raise FileNotFoundError(f"Missing Tessellation Data: {self.config.TESSELATION_PATH}")
+		if not self.config.TESSELLATION_PATH.exists():
+			raise FileNotFoundError(f"Missing Tessellation Data: {self.config.TESSELLATION_PATH}")
 
-		self.tile_gdf = gpd.read_parquet(self.config.TESSELATION_PATH)
+		self.tile_gdf = gpd.read_parquet(self.config.TESSELLATION_PATH)
 		# set index of tessellation to consecutive integers for easier mapping
 		self.tile_gdf.reset_index(drop = True, inplace = True)
 		self.tile_gdf.to_crs(epsg = self.config.CRS_METRIC, inplace = True)
@@ -225,7 +232,10 @@ class MobilityDataManager(Dataset):
 			matrix = np.nan_to_num(matrix, nan = 0.0)
 
 		# 3. Min-Max Scaling
-		self.scaler = MinMaxScaler(feature_range = (0, 1))
+		if self.config.SCALER is not None:
+			self.scaler = self.config.SCALER
+		else:
+			self.scaler = MinMaxScaler(feature_range = (0, 1))
 		matrix = self.scaler.fit_transform(matrix)
 		self.features = torch.tensor(matrix, dtype = self.config.DTYPE)
 
@@ -458,6 +468,19 @@ class MobilityDataManager(Dataset):
 
 		return X, y
 
+	def __getstate__(self):
+		"""Called when pickling: remove the logger."""
+		state = self.__dict__.copy()
+		if 'logger' in state:
+			del state['logger']
+		return state
+
+	def __setstate__(self, state):
+		"""Called when unpickling: restore state and re-init logger."""
+		self.__dict__.update(state)
+		# We must re-run setup because the logger was deleted
+		self._setup_logger()
+
 	# ----------- Functions that are not optimized for large datasets --------------
 	# These are kept for reference or smaller datasets.
 
@@ -587,6 +610,79 @@ class MobilityDataManager(Dataset):
 		self.id_mapper = id_to_matrix_idx
 
 		self.logger.info(f"✅ Computed. Matrix uses {self.distance_matrix.data.nbytes / 1e6:.2f} MB")
+
+	# ----------- (POSSIBLE UPDATE) Tile-Local Distance Matrices  --------------
+	# for faster GPU performance during training and testing.
+
+	@not_implemented
+	def _process_distances_tile_local(self):
+		"""
+		Computes Tile-Local Dense Matrices with Global Normalization.
+		Replaces the BBHash method for O(1) access and better CPU performance.
+		"""
+		self.logger.info("⚙️  Precomputing Tile-Local Dense Matrices...")
+
+		# 1. Coordinate Lookup
+		coord_lookup = {
+			idx: (poly.centroid.x, poly.centroid.y)
+			for idx, poly in self.sections.items()
+		}
+
+		# Temp storage for Pass 1
+		raw_tile_dists: Dict[int, np.ndarray] = {}
+		global_min = float('inf')
+		global_max = float('-inf')
+
+		# --- PASS 1: Calculate Raw Distances & Find Global Min/Max ---
+		for tile_idx, section_idx_set in tqdm.tqdm(
+				self._tile_idx_to_idx.items(),
+				desc = "Calc Raw Distances",
+				total = len(self._tile_idx_to_idx)
+		):
+			sorted_idx = self._tile_idx_to_idx[tile_idx]
+			if len(sorted_idx) < 2: continue
+
+			# Create Map: Global ID -> Local Matrix Row Index
+			for local_row, global_id in enumerate(sorted_idx):
+				self._global_to_local_idx[global_id] = local_row
+
+			points = np.array([coord_lookup[i] for i in sorted_idx])
+
+			# Calculate 1D compressed distance array
+			dists = pdist(points, metric = 'euclidean')
+
+			if dists.size > 0:
+				current_min = dists.min()
+				current_max = dists.max()
+				if current_min < global_min: global_min = current_min
+				if current_max > global_max: global_max = current_max
+
+			raw_tile_dists[tile_idx] = dists
+
+		self._d_min = global_min
+		self._d_max = global_max
+
+		denom = self._d_max - self._d_min
+		if denom == 0: denom = 1.0
+
+		# --- PASS 2: Normalize & Store as Dense Matrices ---
+		for tile_idx, raw_dists in tqdm.tqdm(
+				raw_tile_dists.items(), desc = "Normalize & Store", total = len(raw_tile_dists)
+		):
+			# Normalize in-place
+			raw_dists -= self._d_min
+			raw_dists /= denom
+
+			# Convert to Square Matrix (N x N)
+			dense_matrix = squareform(raw_dists)
+
+			# Store as float16 to save RAM (casted to float32 in __getitem__)
+			self.tile_distance_matrices[tile_idx] = torch.tensor(
+				dense_matrix, dtype = torch.float16
+			)
+
+		del raw_tile_dists
+		self.logger.info("✅  Tile-Local Matrices Computed.")
 
 
 # --- Usage Example ---
@@ -749,19 +845,14 @@ if __name__ == "__main__":
 		dm.logger.info(f"Total Samples: {len(dm)}")
 		dm.logger.info(f"Feature Dimension: {dm.features.shape[1]}")
 
-		# check_size(dm
-		# test_distance(dm, num_tests = 100, seed = 42)
+		check_size(dm)
+		test_distance(dm, num_tests = 100, seed = 42)
 		test_probability_distribution(
 			dm,
 			num_tests = 5,
 			seed = 42,
 			tolerance = 1e-4,
 		)
-
-	# # Verify Shape
-	# x_sample, y_sample = dm[0]
-	# print(f"Sample 0 X Shape: {x_sample.shape} (Destinations, Features*2 + 1)")
-	# print(f"Sample 0 y Shape: {y_sample.shape} (Destinations,)")
 
 	except FileNotFoundError as e:
 		print(f"\n❌ Error: {e}")

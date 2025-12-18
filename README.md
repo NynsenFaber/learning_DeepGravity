@@ -2,6 +2,8 @@
 Implementation of the Deep Gravity model from 
 *Simini, F., Barlacchi, G., Luca, M. et al. A Deep Gravity model for mobility flows generation. Nat Commun 12, 6576 (2021). https://doi.org/10.1038/s41467-021-26752-4*
 
+This served as the base code for my PhD course project at the University of Padova in Deep Learning.
+
 ## Data Processing
 ### Commuting Flows
 From ISTAT website, download: https://www.istat.it/storage/cartografia/matrici_pendolarismo/matrici-pendolarismo-sezione-censimento-2011.zip
@@ -65,4 +67,36 @@ This is a procedure that is highly memory consuming, thus I designed this pipeli
    - Landuse types area (residential, commercial, industrial, natural, retail) in km²
    - Number of POIs and buildings by type (health, education, retail, food, transport)
    Run the script `data_processing/extract_features.py` to generate the features. The output files will be saved as `data/processed_data/sections_features.parquet`.
-   
+
+## Mobility Data Manager
+
+The `MobilityDataManager` class (located in `model/mobility_data_manager.py`) serves as the primary PyTorch `Dataset` for training the Deep Gravity model. It handles the complex logic of loading, cleaning, normalizing, and spatially indexing the processed datasets.
+
+**Key Optimizations:**
+To handle the massive number of potential origin-destination pairs (Italy has ~400k census sections), the manager implements several memory optimizations:
+* **Spatial Filtering:** It performs a spatial join to retain only sections that are spatially contained within the generated 25km tessellation tiles.
+* **Minimal Perfect Hashing (BBHash):** Pairwise distances between sections within the same tile are pre-computed and stored using a static Minimal Perfect Hash function. This avoids the creation of massive dense matrices or memory-heavy Python dictionaries.
+* **Half-Precision:** Tensors and distance arrays are stored using `float16` to minimize RAM footprint.
+
+**Processing Pipeline:**
+1.  **Feature Scaling:** Applies `MinMaxScaler` to all extracted section features (road network, land use, POIs) to normalize inputs between 0 and 1.
+2.  **Commute Normalization:** Converts raw commuter counts into probability distributions ($P_{ij} = \frac{T_{ij}}{\sum_k T_{ik}}$). Flows are constrained locally: we only consider destinations that fall within the same tessellation tile as the origin.
+
+**Output Schema:**
+The dataset is designed to work with a custom collate function. Each item retrieved (`__getitem__`) represents a **single origin** and all its candidate destinations within the tile:
+
+```
+Output Tuple (X, y):
+
+X : torch.Tensor 
+    Shape: (N_destinations, 2 * N_features + 1)
+    Structure: [Origin_Features | Destination_Features | Distance]
+    # Origin features are repeated N times to match the destinations.
+
+y : torch.Tensor
+    Shape: (N_destinations,)
+    Values: Probability of commuting (Sum over N_destinations = 1.0)
+```
+
+## Training the Deep Gravity Model (To be added)
+

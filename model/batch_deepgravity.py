@@ -28,7 +28,7 @@ class BatchDeepGravityNN(nn.Module):
         The padding positions are masked with -inf to ensure numerical correctness
         in downstream Loss or Softmax functions.
     """
-    def __init__(self, input_dim: int = 37):
+    def __init__(self, input_dim: int = 39):
         super(BatchDeepGravityNN, self).__init__()
 
         # Architecture hyper-parameters
@@ -61,7 +61,7 @@ class BatchDeepGravityNN(nn.Module):
                     Real data contains scores.
                     Padding data contains -inf.
         """
-        # 1. Feature Extraction (Batch, Max_Rows, 37) -> (Batch, Max_Rows, 128)
+        # 1. Feature Extraction (Batch, Max_Rows, 39) -> (Batch, Max_Rows, 128)
         features = self.feature_extractor(x)
 
         # 2. Score Projection (Batch, Max_Rows, 128) -> (Batch, Max_Rows, 1)
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
 
     # 1. Setup
-    model = BatchDeepGravityNN(input_dim=37)
+    model = BatchDeepGravityNN(input_dim=39)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # Standard PyTorch Loss (Stable)
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     data = []
     for _ in range(3):
         rows = torch.randint(low=5, high=20, size=(1,)).item()
-        X = torch.randn(rows, 37)
+        X = torch.randn(rows, 39)
         y = torch.rand(rows)
         y = y / y.sum()
         data.append((X, y))
