@@ -1,0 +1,18 @@
+[project]
+name = "deepgravity"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12, <3.14"
+dependencies = [
+    "bbhash>=0.6.0",
+    "geopy>=2.4.1",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.6",
+    "osmium>=4.1.1",
+    "osmnx>=2.0.6",
+    "pyarrow>=21.0.0",
+    "pyrosm>=0.6.2",
+    "scikit-learn>=1.8.0",
+    "torch>=2.8.0",
+    "tqdm>=4.67.1",
+]
