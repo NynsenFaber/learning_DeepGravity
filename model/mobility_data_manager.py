@@ -58,6 +58,9 @@ class DataConfig:
 	# Logging Control
 	VERBOSE: bool = True
 
+	# Negative Sampling
+	MAX_SAMPLES_PER_ORIGIN: Optional[int] = 512  # None means no limit
+
 	# Scaler for normalization
 	SCALER: Optional[MinMaxScaler] = None
 
@@ -82,7 +85,7 @@ class MobilityDataManager(Dataset):
 		self.sections: Dict[int, shapely.geometry.Polygon] = {}  # origin_idx -> geometry
 		self.y: Dict[int, torch.Tensor] = {}  # (origin_idx, dest_idx) -> prob
 		self.scaler: Optional[MinMaxScaler] = None  # to rescale features
-		self.probability: Dict[Tuple[int, int], float] = {}  # (origin_idx, dest_idx) -> prob
+		self.probability: Dict[Tuple[int, int], float] = {}  # (origin_idx, dest_idx) -> prob (does not store zeros)
 		self._d_max: Optional[int] = None  # to rescale distance
 		self._d_min: Optional[int] = None  # to rescale distance
 
@@ -428,36 +431,46 @@ class MobilityDataManager(Dataset):
 		# Shape: (Features,)
 		origin_feat = self.features[origin_idx]
 
-		# 2. Get destinations
+		# 2. Get destinations (Candidates)
 		tile_idx = self._idx_to_tile_idx[origin_idx]
-		# Sort for deterministic ordering
 		destination_ids = sorted(self._tile_idx_to_idx[tile_idx])
 
-		# Shape: (N_destinations, Features)
+		# 3. Apply Negative Sampling if configured
+		if self.config.MAX_SAMPLES_PER_ORIGIN is not None and len(destination_ids) > self.config.MAX_SAMPLES_PER_ORIGIN:
+			# A. Separate Positives (Flow > 0) and Negatives (Flow == 0)
+			positives = []
+			negatives = []
+
+			# Iterate through all candidates in the tile to classify them
+			for dest_id in destination_ids:
+				if (origin_idx, dest_id) in self.probability:
+					positives.append(dest_id)
+				else:
+					negatives.append(dest_id)
+
+			# B. Calculate how many negatives we need to fill the quota
+			n_pos = len(positives)
+			limit = self.config.MAX_SAMPLES_PER_ORIGIN
+
+			if n_pos >= limit:
+				# Rare case: If we have more positives than the limit, take only the top positives
+				destination_ids = sorted(positives[:limit])
+			else:
+				# Common case: We keep ALL positives and fill the rest with random negatives
+				n_neg_needed = limit - n_pos
+
+				# Use numpy for efficient sampling without replacement
+				if len(negatives) > n_neg_needed:
+					sampled_negatives = np.random.choice(negatives, size = n_neg_needed, replace = False).tolist()
+				else:
+					sampled_negatives = negatives
+
+				# Combine and Re-Sort (CRITICAL for alignment)
+				destination_ids = sorted(positives + sampled_negatives)
+
+		# 4. Fetch Features & Update Counts
 		dest_feats = self.features[destination_ids]
-		n_dests = dest_feats.shape[0]
-
-		# 3. Retrieve distances
-		# Shape: (N_destinations,)
-		distances = torch.zeros(n_dests, dtype = self.config.DTYPE)
-		for i, dest_idx in enumerate(destination_ids):
-			# Remember that bbhash contains np.float16 (better storing), pytorch cannot handle it
-			distances[i] = float(self.get_distance_bbhash(origin_idx, dest_idx))
-
-		# 4. Construct X
-		# We need to concatenate: [Origin (repeated) | Destination | Distance]
-
-		# A. Expand origin features to match the number of destinations
-		# Shape becomes (N_destinations, Features)
-		origin_repeated = origin_feat.unsqueeze(0).expand(n_dests, -1)
-
-		# B. Reshape distances to be a column vector
-		# Shape becomes (N_destinations, 1)
-		dist_col = distances.unsqueeze(1)
-
-		# C. Concatenate along columns (dim=1)
-		# Result Shape: (N_destinations, Origin_F + Dest_F + 1)
-		X = torch.cat([origin_repeated, dest_feats, dist_col], dim = 1)
+		n_dests = dest_feats.shape[0]  # This will now be 512 (or less)
 
 		# 5. Retrieve probabilities
 		# Shape: (N_destinations,)
@@ -465,6 +478,24 @@ class MobilityDataManager(Dataset):
 		for i, dest_idx in enumerate(destination_ids):
 			key = (origin_idx, dest_idx)
 			y[i] = self.probability.get(key, 0.0)
+
+		# 6. Retrieve distances
+		# Shape: (N_destinations,)
+		distances = torch.zeros(n_dests, dtype = self.config.DTYPE)
+		for i, dest_idx in enumerate(destination_ids):
+			distances[i] = float(self.get_distance_bbhash(origin_idx, dest_idx))
+
+		# 7. Construct X
+
+		# A. Expand origin features to match the number of destinations
+		origin_repeated = origin_feat.unsqueeze(0).expand(n_dests, -1)
+
+		# B. Reshape distances to be a column vector
+		dist_col = distances.unsqueeze(1)
+
+		# C. Concatenate
+		# All inputs now have size (n_dests, ...)
+		X = torch.cat([origin_repeated, dest_feats, dist_col], dim = 1)
 
 		return X, y
 
