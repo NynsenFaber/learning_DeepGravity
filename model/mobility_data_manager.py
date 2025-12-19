@@ -59,7 +59,7 @@ class DataConfig:
 	VERBOSE: bool = True
 
 	# Negative Sampling
-	MAX_SAMPLES_PER_ORIGIN: Optional[int] = 512  # None means no limit
+	SAMPLES_PER_ORIGIN: int = 512
 
 	# Scaler for normalization
 	SCALER: Optional[MinMaxScaler] = None
@@ -130,8 +130,6 @@ class MobilityDataManager(Dataset):
 		# It filters and normalizes commute flows within the same tessellation grid
 		self._process_commutes()
 		del self.commute_data
-
-	# self._build_fast_index_map()  # Final optimization step
 
 	def _setup_logger(self):
 		# Use the class name so logs are traceable
@@ -425,79 +423,77 @@ class MobilityDataManager(Dataset):
 	def __len__(self):
 		return len(self.features)
 
-	def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+	def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		# 1. Get valid origin
 		origin_idx = self._valid_idx[idx]
-		# Shape: (Features,)
 		origin_feat = self.features[origin_idx]
 
 		# 2. Get destinations (Candidates)
 		tile_idx = self._idx_to_tile_idx[origin_idx]
 		destination_ids = sorted(self._tile_idx_to_idx[tile_idx])
 
-		# 3. Apply Negative Sampling if configured
-		if self.config.MAX_SAMPLES_PER_ORIGIN is not None and len(destination_ids) > self.config.MAX_SAMPLES_PER_ORIGIN:
-			# A. Separate Positives (Flow > 0) and Negatives (Flow == 0)
+		# 3. Apply Negative Sampling if needed
+		target_size = self.config.SAMPLES_PER_ORIGIN  # e.g. 512
+
+		if len(destination_ids) > target_size:
 			positives = []
 			negatives = []
-
-			# Iterate through all candidates in the tile to classify them
 			for dest_id in destination_ids:
 				if (origin_idx, dest_id) in self.probability:
 					positives.append(dest_id)
 				else:
 					negatives.append(dest_id)
 
-			# B. Calculate how many negatives we need to fill the quota
 			n_pos = len(positives)
-			limit = self.config.MAX_SAMPLES_PER_ORIGIN
-
-			if n_pos >= limit:
-				# Rare case: If we have more positives than the limit, take only the top positives
-				destination_ids = sorted(positives[:limit])
+			if n_pos >= target_size:
+				destination_ids = sorted(positives[:target_size])
 			else:
-				# Common case: We keep ALL positives and fill the rest with random negatives
-				n_neg_needed = limit - n_pos
-
-				# Use numpy for efficient sampling without replacement
+				n_neg_needed = target_size - n_pos
 				if len(negatives) > n_neg_needed:
 					sampled_negatives = np.random.choice(negatives, size = n_neg_needed, replace = False).tolist()
 				else:
 					sampled_negatives = negatives
-
-				# Combine and Re-Sort (CRITICAL for alignment)
 				destination_ids = sorted(positives + sampled_negatives)
 
-		# 4. Fetch Features & Update Counts
-		dest_feats = self.features[destination_ids]
-		n_dests = dest_feats.shape[0]  # This will now be 512 (or less)
+		# 4. Prepare Fixed-Size Containers (Pre-allocation is faster than padding later)
+		# Dimensions
+		current_len = len(destination_ids)
+		feature_dim = self.features.shape[1]
+		# Total Features = Origin_Feat (N) + Dest_Feat (N) + Distance (1)
+		total_feature_dim = (feature_dim * 2) + 1
 
-		# 5. Retrieve probabilities
-		# Shape: (N_destinations,)
-		y = torch.zeros(n_dests, dtype = self.config.DTYPE)
-		for i, dest_idx in enumerate(destination_ids):
-			key = (origin_idx, dest_idx)
-			y[i] = self.probability.get(key, 0.0)
+		# Initialize Tensors with Zeros (Padding is implicitly 0)
+		X = torch.zeros((target_size, total_feature_dim), dtype = self.config.DTYPE)
+		y = torch.zeros(target_size, dtype = self.config.DTYPE)
+		mask = torch.zeros(target_size, dtype = torch.bool)  # False = Padding, True = Real
 
-		# 6. Retrieve distances
-		# Shape: (N_destinations,)
-		distances = torch.zeros(n_dests, dtype = self.config.DTYPE)
-		for i, dest_idx in enumerate(destination_ids):
-			distances[i] = float(self.get_distance_bbhash(origin_idx, dest_idx))
+		# 5. Fill Real Data
+		if current_len > 0:
+			# A. Fetch Features & Distances for real destinations
+			dest_feats = self.features[destination_ids]  # (current_len, F)
 
-		# 7. Construct X
+			distances = torch.zeros(current_len, dtype = self.config.DTYPE)
+			for i, dest_idx in enumerate(destination_ids):
+				distances[i] = float(self.get_distance_bbhash(origin_idx, dest_idx))
 
-		# A. Expand origin features to match the number of destinations
-		origin_repeated = origin_feat.unsqueeze(0).expand(n_dests, -1)
+			# B. Construct X components
+			origin_repeated = origin_feat.unsqueeze(0).expand(current_len, -1)
+			dist_col = distances.unsqueeze(1)
 
-		# B. Reshape distances to be a column vector
-		dist_col = distances.unsqueeze(1)
+			# C. Concatenate Real Data
+			X_real = torch.cat([origin_repeated, dest_feats, dist_col], dim = 1)
 
-		# C. Concatenate
-		# All inputs now have size (n_dests, ...)
-		X = torch.cat([origin_repeated, dest_feats, dist_col], dim = 1)
+			# D. Fill the Fixed-Size Tensors (Top part)
+			X[:current_len, :] = X_real
 
-		return X, y
+			# Fill y
+			for i, dest_idx in enumerate(destination_ids):
+				y[i] = self.probability.get((origin_idx, dest_idx), 0.0)
+
+			# Fill Mask
+			mask[:current_len] = True
+
+		return X, y, mask
 
 	def __getstate__(self):
 		"""Called when pickling: remove the logger."""
@@ -716,7 +712,7 @@ class MobilityDataManager(Dataset):
 		self.logger.info("✅  Tile-Local Matrices Computed.")
 
 
-# --- Usage Example ---
+# --- TEST ---
 if __name__ == "__main__":
 	import random
 	import math
