@@ -81,6 +81,8 @@ To handle the massive number of potential origin-destination pairs (Italy has ~4
 **Processing Pipeline:**
 1.  **Feature Scaling:** Applies `MinMaxScaler` to all extracted section features (road network, land use, POIs) to normalize inputs between 0 and 1.
 2.  **Commute Normalization:** Converts raw commuter counts into probability distributions ($P_{ij} = \frac{T_{ij}}{\sum_k T_{ik}}$). Flows are constrained locally: we only consider destinations that fall within the same tessellation tile as the origin.
+3.  **Negative Sampling:** For each origin, destinations with zero commuter flows are sampled to balance the dataset. 
+4.  **Mask Output:** Outputs are masked so that each origin have exactly 512 destinations.
 
 **Output Schema:**
 The dataset is designed to work with a custom collate function. Each item retrieved (`__getitem__`) represents a **single origin** and all its candidate destinations within the tile:
