@@ -421,7 +421,7 @@ class MobilityDataManager(Dataset):
 	# --- Dataset Interface Methods ---
 
 	def __len__(self):
-		return len(self.features)
+		return len(self._valid_idx)
 
 	def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		# 1. Get valid origin
@@ -455,7 +455,7 @@ class MobilityDataManager(Dataset):
 					sampled_negatives = negatives
 				destination_ids = sorted(positives + sampled_negatives)
 
-		# 4. Prepare Fixed-Size Containers (Pre-allocation is faster than padding later)
+		# 4. Prepare Fixed-Size Containers
 		# Dimensions
 		current_len = len(destination_ids)
 		feature_dim = self.features.shape[1]
